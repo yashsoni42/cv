@@ -12,6 +12,7 @@ import re
 from urllib.parse import urlparse, quote
 from datetime import datetime
 from typing import Dict, List, Optional
+from bs4 import BeautifulSoup
 
 
 class LinkedInScraper:
@@ -26,14 +27,20 @@ class LinkedInScraper:
         """
         self.session = requests.Session()
         self.load_cookies(cookies_file)
+        csrf_token = self.get_csrf_token()
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             'Accept': 'application/vnd.linkedin.normalized+json+2.1',
             'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://www.linkedin.com/',
             'x-li-lang': 'en_US',
             'x-restli-protocol-version': '2.0.0',
-            'csrf-token': self.get_csrf_token()
+            'x-li-track': '{"clientVersion":"1.13.18501","mpVersion":"1.13.18501","osName":"web","timezoneOffset":5.5,"timezone":"Asia/Calcutta","deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1,"displayWidth":1920,"displayHeight":1080}',
+            'csrf-token': csrf_token
         }
+        if csrf_token:
+            print(f"CSRF Token loaded: {csrf_token[:20]}...")
 
     def load_cookies(self, cookies_file: str):
         """Load cookies from JSON file into session."""
@@ -101,9 +108,136 @@ class LinkedInScraper:
             print(f"Error getting profile URN: {e}")
             return None
 
+    def fetch_posts_from_html(self, profile_url: str, max_posts: int = 100) -> List[Dict]:
+        """
+        Fetch posts by scraping the profile activity page HTML.
+        This is a fallback method when API endpoints don't work.
+
+        Args:
+            profile_url: LinkedIn profile URL
+            max_posts: Maximum number of posts to fetch
+
+        Returns:
+            List of post dictionaries
+        """
+        profile_id = self.extract_profile_id(profile_url)
+        print(f"Fetching posts from HTML for profile: {profile_id}")
+
+        posts = []
+
+        # First visit the main profile page to establish session
+        print("Visiting profile page to establish session...")
+        try:
+            main_headers = self.headers.copy()
+            main_headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+            main_response = self.session.get(profile_url, headers=main_headers)
+            print(f"Profile page status: {main_response.status_code}")
+        except Exception as e:
+            print(f"Warning: Could not visit profile page: {e}")
+
+        activity_url = f"https://www.linkedin.com/in/{profile_id}/recent-activity/all/"
+
+        try:
+            # Fetch the activity page with browser-like headers
+            activity_headers = self.headers.copy()
+            activity_headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+            activity_headers['Referer'] = profile_url
+            activity_headers['Sec-Fetch-Dest'] = 'document'
+            activity_headers['Sec-Fetch-Mode'] = 'navigate'
+            activity_headers['Sec-Fetch-Site'] = 'same-origin'
+            activity_headers['Upgrade-Insecure-Requests'] = '1'
+
+            response = self.session.get(activity_url, headers=activity_headers)
+            print(f"Activity page status: {response.status_code}")
+            response.raise_for_status()
+
+            # Parse the HTML
+            soup = BeautifulSoup(response.text, 'lxml')
+
+            # Find JSON data embedded in script tags
+            scripts = soup.find_all('script', type='application/json')
+
+            for script in scripts:
+                try:
+                    data = json.loads(script.string)
+                    # Look for posts in the embedded data
+                    if isinstance(data, dict) and 'included' in data:
+                        for item in data['included']:
+                            if item.get('$type') in ['com.linkedin.voyager.feed.render.UpdateV2',
+                                                      'com.linkedin.voyager.dash.feed.Update']:
+                                post_data = self.parse_post_from_html_data(item)
+                                if post_data:
+                                    posts.append(post_data)
+                                    if len(posts) >= max_posts:
+                                        break
+                except json.JSONDecodeError:
+                    continue
+
+            print(f"Fetched {len(posts)} posts from HTML")
+            return posts[:max_posts]
+
+        except Exception as e:
+            print(f"Error fetching posts from HTML: {e}")
+            return posts
+
+    def parse_post_from_html_data(self, item: Dict) -> Optional[Dict]:
+        """
+        Parse post data from HTML embedded JSON.
+
+        Args:
+            item: Post item from embedded JSON data
+
+        Returns:
+            Dictionary containing post data
+        """
+        try:
+            # Extract post text
+            commentary = item.get('commentary', {})
+            post_text = ''
+            if isinstance(commentary, dict):
+                text_obj = commentary.get('text', {})
+                if isinstance(text_obj, dict):
+                    post_text = text_obj.get('text', '')
+                elif isinstance(text_obj, str):
+                    post_text = text_obj
+
+            # Extract timestamp
+            actor = item.get('actor', {})
+            created_time = item.get('createdAt', 0) or actor.get('createdAt', 0)
+            post_date = datetime.fromtimestamp(created_time / 1000) if created_time else None
+
+            # Extract engagement
+            social_detail = item.get('socialDetail', {})
+            total_counts = social_detail.get('totalSocialActivityCounts', {})
+            likes_count = total_counts.get('numLikes', 0)
+            comments_count = total_counts.get('numComments', 0)
+            shares_count = total_counts.get('numShares', 0)
+
+            # Extract post URL
+            share_url = item.get('permalink', '') or item.get('navigationContext', {}).get('actionTarget', '')
+
+            # Extract post ID
+            post_id = item.get('entityUrn', '') or item.get('*id', '')
+
+            return {
+                'post_id': post_id,
+                'post_url': share_url,
+                'text': post_text,
+                'posted_date': post_date.strftime('%Y-%m-%d %H:%M:%S') if post_date else '',
+                'likes': likes_count,
+                'comments': comments_count,
+                'shares': shares_count,
+                'total_engagement': likes_count + comments_count + shares_count
+            }
+
+        except Exception as e:
+            print(f"Error parsing HTML post data: {e}")
+            return None
+
     def fetch_posts(self, profile_url: str, max_posts: int = 100) -> List[Dict]:
         """
         Fetch all posts from a LinkedIn profile.
+        Tries API first, falls back to HTML scraping if needed.
 
         Args:
             profile_url: LinkedIn profile URL
@@ -115,29 +249,51 @@ class LinkedInScraper:
         profile_id = self.extract_profile_id(profile_url)
         print(f"Fetching posts for profile: {profile_id}")
 
+        # Try HTML scraping first as it's more reliable
+        print("Attempting to fetch posts from HTML page...")
+        posts = self.fetch_posts_from_html(profile_url, max_posts)
+
+        if posts:
+            return posts
+
+        # Fallback to API if HTML scraping didn't work
+        print("HTML scraping didn't work, trying API endpoints...")
         posts = []
         start = 0
         count = 20  # Posts per request
 
         while len(posts) < max_posts:
             try:
-                # LinkedIn Voyager API endpoint for profile posts
+                # Try different LinkedIn API endpoints
+                # Endpoint 1: dash API (newer)
                 url = (
-                    f"https://www.linkedin.com/voyager/api/identity/profileUpdatesV2"
+                    f"https://www.linkedin.com/voyager/api/identity/dash/profileUpdates"
                     f"?count={count}"
-                    f"&moduleKey=PROFILE_TOP_CARD"
-                    f"&numComments=0"
-                    f"&numLikes=0"
                     f"&q=memberShareFeed"
                     f"&start={start}"
                     f"&profileUrn=urn:li:fsd_profile:{profile_id}"
                 )
 
+                print(f"Trying URL: {url[:100]}...")
                 response = self.session.get(url, headers=self.headers)
 
                 if response.status_code == 404:
                     print(f"Profile not found or no more posts available.")
                     break
+
+                if response.status_code == 403:
+                    print(f"Access forbidden. Trying alternative endpoint...")
+                    # Try alternative endpoint
+                    url = (
+                        f"https://www.linkedin.com/voyager/api/feed/updates"
+                        f"?count={count}"
+                        f"&start={start}"
+                        f"&q=memberShareFeed"
+                        f"&moduleKey=member-shares:phone"
+                        f"&profileId={profile_id}"
+                    )
+                    print(f"Trying alternative URL: {url[:100]}...")
+                    response = self.session.get(url, headers=self.headers)
 
                 response.raise_for_status()
                 data = response.json()
